@@ -1,0 +1,441 @@
+#!/usr/bin/python3 -Es
+
+'''
+dockerfile-ostree-builder
+
+Copyright (C) 2016 Giuseppe Scrivano <giuseppe@scrivano.org>
+
+dockerfile-ostree-builder is free software; you can redistribute it and/or
+modify it under the terms of the GNU General Public License as published by
+the Free Software Foundation; either version 2 of the License, or
+(at your option) any later version.
+
+dockerfile-ostree-builder is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with Wget.  If not, see <http://www.gnu.org/licenses/>.
+
+Additional permission under GNU GPL version 3 section 7
+'''
+
+import tempfile
+import gi
+from string import Template
+gi.require_version('OSTree', '1.0')
+from gi.repository import Gio, GLib, OSTree
+import shutil
+import os
+import hashlib
+import subprocess
+import sys
+import shlex
+import glob
+import json
+import getopt
+from optparse import OptionParser
+
+PREFIX = "ociimage/"
+
+(COLOR_BLACK,
+ COLOR_RED,
+ COLOR_GREEN,
+ COLOR_YELLOW,
+ COLOR_BLUE,
+ COLOR_MAGENTA,
+ COLOR_CYAN,
+ COLOR_WHITE) = range(30, 38)
+
+def colored(line, color):
+    if sys.stdout.isatty():
+        return "\x1b[1;%dm%s\x1b[0m" % (color, line)
+    else:
+        return line
+
+class DockerfileBuilder():
+    expose = []
+    env = {}
+    labels = {}
+    user = "0"
+    maintainer = ""
+    entrypoint = []
+    cmd = []
+    dry_run = False
+
+    def __init__(self, repo):
+        self.repo = OSTree.Repo.new(Gio.File.new_for_path(repo))
+        self.repo.open(None)
+        
+    @staticmethod
+    def _get_branch_hash(parent, line):
+        h = hashlib.sha256(parent.encode('utf-8') + line.strip().encode('utf-8')).hexdigest()
+        return "%s%s" % (PREFIX, h)
+
+    @staticmethod
+    def _parse_imagename(imagename):
+        sep = imagename.find("/")
+        reg, image = imagename[:sep], imagename[sep + 1:]
+        if '.' not in reg:
+            # if the registry doesn't look like a domain, consider it as the
+            # image prefix
+            reg = ""
+            image = imagename
+        sep = image.find(":")
+        if sep > 0:
+            return reg, image[:sep], image[sep + 1:]
+        else:
+            return reg, image, "latest"
+
+    def commit(self, rev, directory):
+        if self.dry_run:
+            self._dry_run_commit_counter = getattr(self, '_dry_run_commit_counter', 0) + 1
+            return format((0xcafecafecafecafe << (256 - 64)) + self._dry_run_commit_counter, 'x')
+
+        self.repo.prepare_transaction()
+        mtree = OSTree.MutableTree()
+        self.repo.write_directory_to_mtree(Gio.File.new_for_path(directory), mtree, None)
+        root = self.repo.write_mtree(mtree)[1]
+        csum = self.repo.write_commit(None, "", None, None, root)[1]
+        self.repo.transaction_set_ref(None, rev, csum)
+        self.repo.commit_transaction(None)
+        return csum
+
+    def checkout(self, rev, rootfs):
+        if self.dry_run:
+            return
+        rootfs_fd = None
+        try:
+            rootfs_fd = os.open(rootfs, os.O_DIRECTORY)
+            options = OSTree.RepoCheckoutOptions()
+            options.enable_uncompressed_cache = False
+            options.overwrite_mode = OSTree.RepoCheckoutOverwriteMode.UNION_FILES
+            self.repo.checkout_tree_at(options, rootfs_fd, ".", rev)
+        finally:
+            if rootfs_fd:
+                os.close(rootfs_fd)
+
+    def spawn_container(self, rootfs, args, user, env):
+        if self.dry_run:
+            return
+        env_array = []
+        for k, v in env.items():
+            env_array += ["--setenv=%s=%s" % (k, v)]
+        subprocess.call(["systemd-nspawn", "--user", str(user), "-D", rootfs] + env_array + ["sh", "-c", args])
+
+    def check_if_in_cache(self, nline, line, parent):
+        ind = line.find(' ')
+        cmd, args = line[0:ind], line[ind+1:]
+        if nline == 0 and cmd != "FROM":
+            raise Exception("First line must contain FROM")
+
+        try:
+            if cmd == "FROM":
+                if args == "scratch":
+                    return True, ""
+                regloc, image, tag = DockerfileBuilder._parse_imagename(args)
+                branch = "%s-%s" % (image, tag)
+                rev = self.repo.resolve_rev("%s%s" % (PREFIX, branch), False)
+            else:
+                branch = DockerfileBuilder._get_branch_hash(parent, line)
+                rev = self.repo.resolve_rev("%s" % branch, False)
+        except:
+            rev = False, None
+        return rev[0], rev[1]
+
+    def generate_oci(self, temp_dir):
+        exports = os.path.join(temp_dir, "rootfs", "exports")
+        if not os.path.exists(exports):
+            os.mkdir(exports)
+        cmdline = ["ocitools", "generate", "--read-only"]
+        for k, v in self.env.items():
+            cmdline += ["--env=%s=%s" % (k, v)]
+        for k, v in self.labels.items():
+            cmdline += ["--labels=%s=%s" % (k, v)]
+        if self.user:
+            cmdline += ["--uid=%s" % int(self.user)]
+        for i in self.entrypoint:
+            cmdline += ["--args=%s" % i]
+        for i in self.cmd:
+            cmdline += ["--args=%s" % i]
+
+        subprocess.call(cmdline, cwd=exports)
+        return " ".join(cmdline)
+
+    def handle_line(self, metadata_only, nline, parent, temp_dir, line):
+        ind = line.find(' ')
+        cmd, args = line[0:ind], line[ind+1:]
+        if nline == 0 and cmd != "FROM":
+            raise Exception("First line must contain FROM")
+
+        rev = DockerfileBuilder._get_branch_hash(parent, line)
+        rootfs = os.path.join(temp_dir, "rootfs")
+
+        if cmd == "ADD":
+            raise Exception("Unsupported command '%s'" % cmd)
+        elif cmd == "ARG":
+            raise Exception("Unsupported command '%s'" % cmd)
+        elif cmd == "CMD":
+            if args.strip()[0] == '[':
+                parts = json.loads(args)
+                self.cmd += parts
+            else:
+                self.cmd += [args]
+        elif cmd == "ENTRYPOINT":
+            if args.strip()[0] == '[':
+                parts = json.loads(args)
+                self.entrypoint += parts
+            else:
+                self.entrypoint += [args]
+        elif cmd == "COPY":
+            if metadata_only:
+                return None
+            rootfs = os.path.join(temp_dir, "rootfs")
+            def copy(pattern, rootfs, to):
+                destination_path = (rootfs + "/" + to).replace("//", "/")
+                if not os.path.exists(os.path.dirname(destination_path)):
+                    os.makedirs(os.path.dirname(destination_path))
+                for i in glob.glob(pattern):
+                    src = os.path.join(self.path, i)
+                    if os.path.isdir(src):
+                        shutil.copytree(src, destination_path)
+                    else:
+                        shutil.copy(src, destination_path)
+
+            if args.strip()[0] == '[':
+                parts = json.loads(args)
+            else:
+                parts = args.split()
+            for i in parts[:-1]:
+                copy(i, rootfs, parts[-1])
+        elif cmd == "ENV":
+            tokens = list(shlex.shlex(args))
+            if tokens[1] == "=":
+                cur = 0
+                while cur < len(tokens):
+                    var = tokens[cur + 0]
+                    value = tokens[cur + 2]
+                    cur = cur + 3
+                    self.env[var] = value
+            else:
+                split = args.find(' ')
+                var, value = line[0:split], line[split+1:]
+                print("Extract env %s=%s" % (colored(var, COLOR_BLUE), colored(value, COLOR_MAGENTA)))
+                self.env[var] = value
+        elif cmd == "EXPOSE":
+            for i in args.split():
+                self.expose[i] = i
+        elif cmd == "LABEL":
+            tokens = list(shlex.shlex(args))
+            cur = 0
+            while cur < len(tokens):
+                var = tokens[cur + 0]
+                value = tokens[cur + 2]
+                cur = cur + 3
+                print("Extract label %s=%s" % (colored(var, COLOR_BLUE), colored(value, COLOR_MAGENTA)))
+                self.labels[var] = value
+        elif cmd == "MAINTAINER":
+            self.maintainer = args
+        elif cmd == "USER":
+            self.user = args
+        elif cmd == "WORKDIR":
+            raise Exception("Unsupported command '%s'" % cmd)
+        elif cmd == "VOLUME":
+            raise Exception("Unsupported command '%s'" % cmd)
+        elif cmd == "STOPSIGNAL":
+            raise Exception("Unsupported command '%s'" % cmd)
+        elif cmd == "ONBUILD":
+            raise Exception("Unsupported command '%s'" % cmd)
+        elif cmd == "FROM":
+            raise Exception("FROM is valid only as first line")
+        elif cmd == "RUN":
+            if metadata_only:
+                return None
+            self.spawn_container(rootfs, args, self.user, self.env)
+        else:
+            raise Exception("Unknown command '%s'" % cmd)
+
+        if metadata_only:
+            return None
+        commit = self.commit(rev, rootfs)
+        print("Created commit %s" % colored(commit, COLOR_YELLOW))
+        return commit
+
+    def checkout_tree(self, image, destination):
+        rootfs = os.path.join(os.path.abspath(destination), "rootfs")
+        rootfs_fd = None
+        regloc, image, tag = DockerfileBuilder._parse_imagename(image)
+        branch = "%s-%s" % (image, tag)
+        os.makedirs(rootfs)
+        try:
+            options = OSTree.RepoCheckoutOptions()
+            options.overwrite_mode = OSTree.RepoCheckoutOverwriteMode.UNION_FILES
+            rootfs_fd = os.open(rootfs, os.O_DIRECTORY)
+            rev = self.repo.resolve_rev("%s%s" % (PREFIX, branch), False)[1]
+            self.repo.checkout_tree_at(options, rootfs_fd, rootfs, rev)
+            config = os.path.join(rootfs, "exports", "config.json")
+            if os.path.exists(config):
+                shutil.copyfile(config, os.path.join(destination, "config.json"))
+        finally:
+            if rootfs_fd:
+                os.close(rootfs_fd)
+
+
+    def tag_branch(self, branch, commit):
+        if self.dry_run:
+            return
+        self.repo.prepare_transaction()
+        self.repo.transaction_set_ref(None, branch, commit)
+        self.repo.commit_transaction(None)
+
+    def import_from_docker(self, name):
+        regloc, image, tag = DockerfileBuilder._parse_imagename(name)
+        branch = "%s%s-%s" % (PREFIX, image, tag)
+        temp_dir = tempfile.mkdtemp()
+        container_name = "ostree-build-%s" % os.getpid()
+        dest = os.path.join(temp_dir, "container.tar")
+        try:
+            subprocess.call(["docker", "pull", name])
+            subprocess.call(["docker", "run", "--name=" + container_name, name, "/bin/sh"])
+            subprocess.call(["docker", "export", "-o", dest, container_name])
+
+            self.repo.prepare_transaction()
+
+            mtree = OSTree.MutableTree()
+            self.repo.write_archive_to_mtree(Gio.File.new_for_path(dest), mtree, None, True)
+            root = self.repo.write_mtree(mtree)[1]
+            csum = self.repo.write_commit(None, "", None, None, root)[1]
+            self.repo.transaction_set_ref(None, branch, csum)
+
+            self.repo.commit_transaction(None)
+
+        finally:
+            subprocess.call(["docker", "rm", "-f", container_name])
+            shutil.rmtree(temp_dir)
+
+
+    def parse_document(self, options):
+        self.path = os.path.abspath(options.path)
+        name = options.tag or os.path.basename(self.path)
+        temp_dir = tempfile.mkdtemp(prefix='tmpostreebuild')
+        os.mkdir(os.path.join(temp_dir, "rootfs"))
+        last_in_cache = ""
+        try:
+            doc = ""
+            with open(os.path.join(self.path, "Dockerfile")) as f:
+                doc = f.read()
+
+            all_lines = [line.strip() for line in doc.replace('\\\n', "").split("\n")]
+            # Remove empty lines and comments
+            lines = [line for line in all_lines if len(line) > 0 and line[0] != '#']
+            nline = 0
+            last_commit = ""
+            for line in lines:
+                present, rev = self.check_if_in_cache(nline, line, last_commit)
+                if present:
+                    print(colored(line, COLOR_GREEN))
+                    if nline > 0:
+                        self.handle_line(True, nline, last_commit, temp_dir, line)
+                    last_in_cache = rev
+                    nline = nline + 1
+                    last_commit = rev
+                    print("Found commit %s" % (colored(last_commit, COLOR_YELLOW)))
+                    if options.nocache:
+                        break
+                else:
+                    break
+
+            if last_in_cache == "":
+                raise Exception("Cannot find image in FROM field")
+
+            checked_out_cache = False
+            for line in lines[nline:]:
+                if not checked_out_cache:
+                    self.checkout(last_in_cache, os.path.join(temp_dir, "rootfs"))
+                    checked_out_cache = True
+                print(colored(line, COLOR_GREEN))
+                last_commit = self.handle_line(False, nline, last_commit, temp_dir, line)
+                nline = nline + 1
+
+            if options.generate_oci:
+                if not checked_out_cache:
+                    self.checkout(last_in_cache, os.path.join(temp_dir, "rootfs"))
+                    checked_out_cache = True
+                line = self.generate_oci(temp_dir)
+                if options.edit_oci and not self.dry_run:
+                    subprocess.call([edit_oci, os.path.join(temp_dir, "rootfs", "exports", "config.json")])
+
+                rootfs = os.path.join(temp_dir, "rootfs")
+                rev = DockerfileBuilder._get_branch_hash(last_commit, line)
+                last_commit = self.commit(rev, rootfs)
+
+            regloc, image, tag = DockerfileBuilder._parse_imagename(name)
+            branch = "%s%s-%s" % (PREFIX, image, tag)
+            self.tag_branch(branch, last_commit)
+            print("Tagged commit %s as %s" % (colored(last_commit, COLOR_YELLOW), colored(branch, COLOR_CYAN)))
+        finally:
+            shutil.rmtree(temp_dir)
+
+################################################################################
+parser = OptionParser()
+parser.add_option("--repo", dest="repo",
+                  help="OSTree repo to use", metavar="REPO")
+parser.add_option("--dry-run",
+                  action="store_true", dest="dry_run", default=False,
+                  help="don't persist any change")
+parser.add_option("--tag", dest="tag", help="Tag name to create")
+parser.add_option("--no-cache",
+                  action="store_true", dest="nocache", default=False,
+                  help="don't use the cache")
+parser.add_option("--import-from-docker",
+                  action="store_true", dest="import_from_docker", default=False,
+                  help="import the image from Docker")
+parser.add_option("--generate-oci-config",
+                  action="store_true", dest="generate_oci", default=False,
+                  help="Generate the OCI configuration in /exports")
+parser.add_option("--edit-oci-configuration", dest="edit_oci",
+                  help="Specify a command to edit the OCI configuration before storing it",
+                  metavar='CONFIG')
+parser.add_option("--checkout",
+                  action="store_true", dest="checkout", default=False,
+                  help="Checkout the container")
+parser.add_option("--path",
+                  dest="path", default=".", metavar="PATH",
+                  help="Path to the directory which contains Dockerfile (default '.')")
+
+(options, args) = parser.parse_args()
+try:
+    oci_tools_found = True
+    if options.generate_oci:
+        try:
+            with open(os.devnull, 'w') as dev_null:
+                subprocess.check_call(["ocitools", "--version"], stdout=dev_null, stderr=dev_null)
+        except:
+            oci_tools_found = False
+
+    if not oci_tools_found:
+        raise Exception("--generate-oci-config specified but ocitools not found")
+
+    if not options.repo:
+        raise Exception("--repo not specified")
+
+    if options.import_from_docker and (options.edit_oci or
+                                       options.generate_oci):
+        raise Exception("--import-from-docker doesn't support OCI options (yet)")
+
+    builder = DockerfileBuilder(options.repo)
+    builder.dry_run = options.dry_run
+    if options.checkout:
+        if len(args) != 3:
+            raise Exception("--checkout needs two arguments")
+        builder.checkout_tree(args[1], args[2])
+    elif options.import_from_docker:
+        for i in args:
+            builder.import_from_docker(i)
+    else:
+        builder.parse_document(options)
+except Exception as e:
+    print("Error %s" % colored(str(e), COLOR_RED))
+ 
+# mode: python
