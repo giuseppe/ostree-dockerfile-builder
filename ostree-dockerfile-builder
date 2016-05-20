@@ -36,6 +36,7 @@ import glob
 import json
 import getopt
 from optparse import OptionParser
+import tarfile
 
 PREFIX = "ociimage/"
 
@@ -67,7 +68,7 @@ class DockerfileBuilder():
     def __init__(self, repo):
         self.repo = OSTree.Repo.new(Gio.File.new_for_path(repo))
         self.repo.open(None)
-        
+
     @staticmethod
     def _get_branch_hash(parent, line):
         h = hashlib.sha256(parent.encode('utf-8') + line.strip().encode('utf-8')).hexdigest()
@@ -159,9 +160,18 @@ class DockerfileBuilder():
             cmdline += ["--args=%s" % i]
         for i in self.cmd:
             cmdline += ["--args=%s" % i]
-
         subprocess.call(cmdline, cwd=exports)
         return " ".join(cmdline)
+
+    def import_config_from_riddler(self, temp_dir, name):
+        exports = os.path.join(temp_dir, "rootfs", "exports")
+        if not os.path.exists(exports):
+            os.mkdir(exports)
+        cmdline = ["riddler", name]
+        with open(os.devnull, 'w') as dev_null:
+            subprocess.call(cmdline, cwd=exports, stdout=dev_null, stderr=dev_null)
+        return " ".join(cmdline)
+
 
     def handle_line(self, metadata_only, nline, parent, temp_dir, line):
         ind = line.find(' ')
@@ -289,21 +299,42 @@ class DockerfileBuilder():
         self.repo.transaction_set_ref(None, branch, commit)
         self.repo.commit_transaction(None)
 
-    def import_from_docker(self, name):
+    def import_from_docker(self, name, generate_oci, keep):
         regloc, image, tag = DockerfileBuilder._parse_imagename(name)
         branch = "%s%s-%s" % (PREFIX, image, tag)
         temp_dir = tempfile.mkdtemp()
-        container_name = "ostree-build-%s" % os.getpid()
-        dest = os.path.join(temp_dir, "container.tar")
+        is_container = True
         try:
-            subprocess.call(["docker", "pull", name])
-            subprocess.call(["docker", "run", "--name=" + container_name, name, "/bin/sh"])
-            subprocess.call(["docker", "export", "-o", dest, container_name])
+            with open(os.devnull, 'w') as dev_null:
+                subprocess.check_call(["docker", "inspect", name], stdout=dev_null, stderr=dev_null)
+        except:
+            is_container = False
+
+        if is_container:
+            tag = name
+        else:
+            tag = "ostree-build-%s" % os.getpid()
+
+        dest = os.path.join(temp_dir, "container.tar")
+        rootfs = os.path.join(temp_dir, "rootfs")
+        exports = os.path.join(rootfs, "exports")
+        if not os.path.exists(exports):
+            os.makedirs(exports)
+        try:
+            if not is_container:
+                subprocess.call(["docker", "pull", name])
+                subprocess.call(["docker", "run", "--name=" + tag, name, "/bin/sh"])
+
+            subprocess.call(["docker", "export", "-o", dest, tag])
+            tar = tarfile.TarFile(dest)
+            tar.extractall(os.path.join(temp_dir, rootfs))
+
+            if generate_oci:
+                self.import_config_from_riddler(temp_dir, tag)
 
             self.repo.prepare_transaction()
-
             mtree = OSTree.MutableTree()
-            self.repo.write_archive_to_mtree(Gio.File.new_for_path(dest), mtree, None, True)
+            self.repo.write_directory_to_mtree(Gio.File.new_for_path(rootfs), mtree, None)
             root = self.repo.write_mtree(mtree)[1]
             csum = self.repo.write_commit(None, "", None, None, root)[1]
             self.repo.transaction_set_ref(None, branch, csum)
@@ -311,15 +342,18 @@ class DockerfileBuilder():
             self.repo.commit_transaction(None)
 
         finally:
-            subprocess.call(["docker", "rm", "-f", container_name])
-            shutil.rmtree(temp_dir)
-
+            if not is_container:
+                subprocess.call(["docker", "rm", "-f", container_name])
+            if not keep:
+                shutil.rmtree(temp_dir)
+            else:
+                print("Temporary directory: %s" % temp_dir)
 
     def parse_document(self, options):
         self.path = os.path.abspath(options.path)
         name = options.tag or os.path.basename(self.path)
         temp_dir = tempfile.mkdtemp(prefix='tmpostreebuild')
-        os.mkdir(os.path.join(temp_dir, "rootfs"))
+        os.makedirs(os.path.join(temp_dir, "rootfs"))
         last_in_cache = ""
         try:
             doc = ""
@@ -375,7 +409,10 @@ class DockerfileBuilder():
             self.tag_branch(branch, last_commit)
             print("Tagged commit %s as %s" % (colored(last_commit, COLOR_YELLOW), colored(branch, COLOR_CYAN)))
         finally:
-            shutil.rmtree(temp_dir)
+            if not options.keep:
+                shutil.rmtree(temp_dir)
+            else:
+                print("Temporary directory: %s" % temp_dir)
 
 ################################################################################
 parser = OptionParser()
@@ -403,26 +440,34 @@ parser.add_option("--checkout",
 parser.add_option("--path",
                   dest="path", default=".", metavar="PATH",
                   help="Path to the directory which contains Dockerfile (default '.')")
+parser.add_option("--keep",
+                  action="store_true", dest="keep", default=False,
+                  help="Do not delete the temporary path")
 
 (options, args) = parser.parse_args()
 try:
-    oci_tools_found = True
     if options.generate_oci:
-        try:
-            with open(os.devnull, 'w') as dev_null:
-                subprocess.check_call(["ocitools", "--version"], stdout=dev_null, stderr=dev_null)
-        except:
-            oci_tools_found = False
-
-    if not oci_tools_found:
-        raise Exception("--generate-oci-config specified but ocitools not found")
+        if options.import_from_docker:
+            riddler_found = True
+            try:
+                with open(os.devnull, 'w') as dev_null:
+                    subprocess.check_call(["riddler", "--version", "foo"], stdout=dev_null, stderr=dev_null)
+            except:
+                riddler_found = False
+            if not riddler_found:
+                raise Exception("--import-from-docker and --generate-oci-config specified but riddler not found")
+        else:
+            oci_tools_found = True
+            try:
+                with open(os.devnull, 'w') as dev_null:
+                    subprocess.check_call(["ocitools", "--version"], stdout=dev_null, stderr=dev_null)
+            except:
+                oci_tools_found = False
+            if not oci_tools_found:
+                raise Exception("--generate-oci-config specified but ocitools not found")
 
     if not options.repo:
         raise Exception("--repo not specified")
-
-    if options.import_from_docker and (options.edit_oci or
-                                       options.generate_oci):
-        raise Exception("--import-from-docker doesn't support OCI options (yet)")
 
     builder = DockerfileBuilder(options.repo)
     builder.dry_run = options.dry_run
@@ -432,10 +477,10 @@ try:
         builder.checkout_tree(args[1], args[2])
     elif options.import_from_docker:
         for i in args:
-            builder.import_from_docker(i)
+            builder.import_from_docker(i, options.generate_oci, options.keep)
     else:
         builder.parse_document(options)
 except Exception as e:
     print("Error %s" % colored(str(e), COLOR_RED))
- 
+
 # mode: python
